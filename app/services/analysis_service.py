@@ -1,18 +1,19 @@
 """
 SMARTZI - Analysis Orchestrator
-Coordinates the full AI pipeline: metadata → ELA → classifier → ManTraNet → verdict.
+Coordinates the full AI pipeline safely with isolated sequential memory execution.
 """
 
 import logging
 import os
 import uuid
+import gc
 from datetime import datetime, timezone
 from typing import List, Optional
+from PIL import Image
 
 from app.schemas.analysis import AnalysisResult, ImageMetadata, ELAResult, ClassifierResult, MantraNetResult
 from app.services.metadata_service import metadata_extractor
 from app.services.ela_service import ela_service
-from app.services.mantranet_service import mantranet_service
 from app.services.trufor_service import trufor_service
 from app.services.aide_service import aide_service
 from app.services.forensic_stats_service import compute_statistical_signals
@@ -22,27 +23,23 @@ logger = logging.getLogger("smartzi.analysis")
 
 
 class AnalysisOrchestrator:
-    """
-    Combines all AI signals and applies a deterministic fusion rule to
-    produce a final verdict and risk score.
+    ELA_SUSPICIOUS_THRESHOLD = 12.0
+    ELA_REGION_THRESHOLD = 3
+    TAMPERED_CONFIDENCE_HIGH = 0.75
+    MANTRANET_SCORE_THRESHOLD = 0.15
 
-    Fusion weights (when ManTraNet is available):
-        - ELA signal:        25%
-        - CNN classifier:    30%
-        - ManTraNet:         35%
-        - Metadata anomaly:  10%
-
-    Fusion weights (fallback without ManTraNet):
-        - ELA signal:        40%
-        - CNN classifier:    45%
-        - Metadata anomaly:  15%
-    """
-
-    # Thresholds tuned empirically
-    ELA_SUSPICIOUS_THRESHOLD = 12.0   # mean ELA intensity above this → suspicious
-    ELA_REGION_THRESHOLD = 3          # suspicious region count above this → flagged
-    TAMPERED_CONFIDENCE_HIGH = 0.75   # classifier is "very confident" of tampering
-    MANTRANET_SCORE_THRESHOLD = 0.15  # ManTraNet mean score above this → suspicious
+    def _resize_image_if_large(self, image_path: str):
+        """Downscale target image to fit into RAM memory boundaries during tensor operations."""
+        try:
+            with Image.open(image_path) as img:
+                MAX_DIM = 720
+                if img.size[0] > MAX_DIM or img.size[1] > MAX_DIM:
+                    logger.info("Image exceeds safe resolution limits (%s). Compressing...", img.size)
+                    img.thumbnail((MAX_DIM, MAX_DIM), Image.Resampling.LANCZOS)
+                    # Overwrite file with memory-optimized footprint variation
+                    img.save(image_path, quality=90, subsampling=0)
+        except Exception as re:
+            logger.error("Image pre-downscaling optimization skipped: %s", re)
 
     async def run(
         self,
@@ -51,43 +48,57 @@ class AnalysisOrchestrator:
         user_id: str,
         filename: str,
     ) -> AnalysisResult:
-        """
-        Execute the full analysis pipeline and persist results to Firestore.
-        """
         logger.info("Starting analysis | upload_id=%s filename=%s", upload_id, filename)
 
-        import asyncio
+        # 1. Optimize input payload size boundaries
+        self._resize_image_if_large(image_path)
 
+        import asyncio
         from app.services.model_manager import model_manager
 
-        async def run_mantranet():
-            # Deprecated: ManTraNet removed from active chain
-            return None
-
-        tasks = [
+        # 2. RUN LIGHTWEIGHT RECURSIVE HEURISTICS IN PARALLEL (Metadata, ELA, Stats consume negligible RAM)
+        logger.debug("Executing lightweight statistical and metadata extractions...")
+        heuristic_tasks = [
             asyncio.to_thread(metadata_extractor.extract, image_path),
             asyncio.to_thread(ela_service.analyze, image_path),
             asyncio.to_thread(compute_statistical_signals, image_path),
-            asyncio.to_thread(trufor_service.analyze, image_path),
-            run_mantranet(),
-            model_manager.predict(image_path, "image", None),
-            asyncio.to_thread(aide_service.predict, image_path),
         ]
+        heuristic_results = await asyncio.gather(*heuristic_tasks, return_exceptions=True)
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        metadata = heuristic_results[0] if not isinstance(heuristic_results[0], Exception) else ImageMetadata(filename=filename, file_size_kb=0, has_exif=False)
+        ela = heuristic_results[1] if not isinstance(heuristic_results[1], Exception) else ELAResult(ela_mean=0, ela_max=0, ela_std=0, suspicious_regions=0)
+        stat_signals = heuristic_results[2] if not isinstance(heuristic_results[2], Exception) else {"fft": None, "noise": None, "metadata": None}
 
-        # Handle exceptions gracefully to prevent full request failure
-        metadata = results[0] if not isinstance(results[0], Exception) else ImageMetadata(filename=filename, file_size_kb=0, has_exif=False)
-        ela = results[1] if not isinstance(results[1], Exception) else ELAResult(ela_mean=0, ela_max=0, ela_std=0, suspicious_regions=0)
-        stat_signals = results[2] if not isinstance(results[2], Exception) else {
-            "fft": None, "noise": None, "metadata": None,
-        }
-        trufor_result = results[3] if not isinstance(results[3], Exception) else None
-        mantranet_result = results[4] if not isinstance(results[4], Exception) else None
-        mm_result = results[5]
-        aide_result = results[6] if not isinstance(results[6], Exception) else None
-        if isinstance(mm_result, Exception):
-            logger.error("ModelManager failed entirely: %s", mm_result)
+        # 3. SEQUENTIAL ISOLATION FOR HEAVY MODELS (Prevents parallel footprint explosion)
+        trufor_result = None
+        try:
+            logger.debug("Ingesting image layer data into isolated TruFor pipeline...")
+            trufor_result = await asyncio.to_thread(trufor_service.analyze, image_path)
+        except Exception as te:
+            logger.error("TruFor execution failed: %s", te)
+        finally:
+            gc.collect() # Immediately drop structural memory references
+
+        mm_result = None
+        try:
+            logger.debug("Ingesting image into model_manager fallback route...")
+            mm_result = await model_manager.predict(image_path, "image", None)
+        except Exception as mme:
+            logger.error("ModelManager prediction failure: %s", mme)
+        finally:
+            gc.collect()
+
+        aide_result = None
+        try:
+            logger.debug("Ingesting image into isolated AIDE detector pipeline...")
+            aide_result = await asyncio.to_thread(aide_service.predict, image_path)
+        except Exception as ae:
+            logger.error("AIDE detector invocation failure: %s", ae)
+        finally:
+            gc.collect()
+
+        # Handle fallback instantiation state defaults
+        if mm_result is None or isinstance(mm_result, Exception):
             mm_result = {
                 "status": "MODEL_DISABLED",
                 "prediction": None,
@@ -100,6 +111,7 @@ class AnalysisOrchestrator:
                 "fallback_chain": [],
             }
 
+        # 4. PARSE CLASSIFIER DATA STRUCTS
         if trufor_result:
             classifier = ClassifierResult(
                 status="ACTIVE",
@@ -135,30 +147,9 @@ class AnalysisOrchestrator:
                 source="fallback",
             )
 
-        logger.debug("Metadata extracted | has_exif=%s", metadata.has_exif)
-        logger.debug("ELA complete | mean=%.2f regions=%d", ela.ela_mean, ela.suspicious_regions)
-        logger.debug(
-            "TruFor | %s",
-            f"{trufor_result.get('prediction')} ({trufor_result.get('confidence')})" if trufor_result else "N/A",
-        )
-
-        if mantranet_result:
-            logger.debug(
-                "ManTraNet | score=%.4f regions=%d area=%.1f%%",
-                mantranet_result.forgery_score,
-                mantranet_result.tampered_regions,
-                mantranet_result.tampered_area_pct,
-            )
-        else:
-            logger.info("ManTraNet disabled — using fallback fusion")
-
-        # ── Stage 5: Fusion & Verdict ─────────────────────────────────────
-        # Retain local heuristic flags, but use ModelManager/AI Detector for primary verdict
-        _, _, flags = self._compute_verdict(
-            metadata, ela, classifier, mantranet_result
-        )
+        # 5. FUSION & VERDICT CONSOLIDATION
+        _, _, flags = self._compute_verdict(metadata, ela, classifier, None)
         
-        # Merge results: use AIGeneratedDetector's fine-grained forensic classifications
         verdict = mm_result.get("prediction") or "UNCERTAIN"
         if verdict == "AUTHENTIC" and trufor_result and trufor_result.get("prediction") == "TAMPERED":
             verdict = "TAMPERED"
@@ -191,16 +182,8 @@ class AnalysisOrchestrator:
             "trufor": trufor_result,
             "model_manager_source": mm_result.get("source"),
         }
-        mantranet_summary = (
-            {
-                "forgery_score": mantranet_result.forgery_score,
-                "tampered_regions": mantranet_result.tampered_regions,
-                "tampered_area_pct": mantranet_result.tampered_area_pct,
-            }
-            if mantranet_result
-            else None
-        )
 
+        # 6. EXTERNAL REMOTE SYSTEM ASSESSMENTS (GEMINI API)
         from app.services.gemini_service import gemini_service
         from app.core.config import settings
         from app.core.confidence_fusion import fuse_confidence_scores as run_confidence_fusion
@@ -214,7 +197,7 @@ class AnalysisOrchestrator:
                     ela_summary=ela_summary,
                     classifier_summary=classifier_summary,
                     ai_detector_summary=ai_detector_summary,
-                    mantranet_summary=mantranet_summary,
+                    mantranet_summary=None,
                 )
             except Exception as ge:
                 logger.error("Gemini cross-check failed: %s", ge)
@@ -225,7 +208,6 @@ class AnalysisOrchestrator:
             ai_explanation = mm_result.get("explanation", "")
 
         trufor_val = float(trufor_result["confidence"]) if trufor_result and trufor_result.get("confidence") is not None else None
-        mantra_val = float(mantranet_result.forgery_score) if mantranet_result else None
         ela_val = float(min(ela.ela_mean / 25.0, 1.0))
         metadata_val = stat_signals.get("metadata")
         noise_val = stat_signals.get("noise")
@@ -234,7 +216,7 @@ class AnalysisOrchestrator:
 
         confidence = run_confidence_fusion(
             trufor_conf=trufor_val,
-            mantranet_conf=mantra_val,
+            mantranet_conf=None,
             ela_conf=ela_val,
             metadata_conf=metadata_val,
             noise_conf=noise_val,
@@ -247,7 +229,6 @@ class AnalysisOrchestrator:
             confidence = max(0.0, min(1.0, confidence + adjustment))
 
         risk_score = confidence * 100.0
-
         summary = f"{ai_explanation}\n\n**Source:** {mm_result.get('source', 'forensic')}"
         if mm_result.get("fallback_used"):
             summary += f" (Fallback chain: {' → '.join(mm_result.get('fallback_chain', []))})"
@@ -255,7 +236,7 @@ class AnalysisOrchestrator:
         if flags:
             summary += "\n\n**Flags raised:**\n" + "\n".join([f"- {f}" for f in flags])
 
-        # ── Stage 6: Persist to Firestore ────────────────────────────────────
+        # 7. WRITE OUTPUTS TO FIREBASE RECORD STORES
         scan_id = str(uuid.uuid4())
         created_at = datetime.now(timezone.utc)
 
@@ -275,11 +256,9 @@ class AnalysisOrchestrator:
             "classifier_confidence": classifier.confidence,
             "has_exif": metadata.has_exif,
             "camera_model": metadata.camera_model,
-            # ManTraNet fields
-            "mantranet_score": mantranet_result.forgery_score if mantranet_result else None,
-            "mantranet_regions": mantranet_result.tampered_regions if mantranet_result else None,
-            "mantranet_area_pct": mantranet_result.tampered_area_pct if mantranet_result else None,
-            # AI detector fields
+            "mantranet_score": None,
+            "mantranet_regions": None,
+            "mantranet_area_pct": None,
             "ai_generated_probability": ai_gen_prob,
             "tampered_probability": ai_tamp_prob,
             "metadata_score": ai_meta_score,
@@ -298,13 +277,11 @@ class AnalysisOrchestrator:
             metadata=metadata,
             ela=ela,
             classifier=classifier,
-            mantranet=mantranet_result,
+            mantranet=None,
             verdict=verdict,
             risk_score=round(risk_score, 1),
             summary=summary,
             flags=flags,
-            
-            # AI-Generated Detector Response Schema Fields
             confidence=confidence,
             ai_generated_probability=ai_gen_prob,
             tampered_probability=ai_tamp_prob,
@@ -313,7 +290,6 @@ class AnalysisOrchestrator:
             explanation=ai_explanation
         )
 
-    # ── Fusion Logic ──────────────────────────────────────────────────────────
     def _compute_verdict(
         self,
         metadata: ImageMetadata,
@@ -321,52 +297,21 @@ class AnalysisOrchestrator:
         classifier: ClassifierResult,
         mantranet: Optional[MantraNetResult],
     ):
-        """
-        Weighted fusion of signals into a final verdict + risk score.
-        Uses 4-signal fusion when ManTraNet is available, 3-signal fallback otherwise.
-        Returns (verdict, risk_score_0_to_100, flags)
-        """
         flags: List[str] = []
 
-        # --- ELA signal (0–100) ---
         ela_score = min(ela.ela_mean / 25.0, 1.0) * 100
         if ela.ela_mean > self.ELA_SUSPICIOUS_THRESHOLD:
             flags.append(f"High ELA mean ({ela.ela_mean:.1f}) — possible compression artifacts")
         if ela.suspicious_regions > self.ELA_REGION_THRESHOLD:
             flags.append(f"{ela.suspicious_regions} suspicious high-ELA regions detected")
 
-        # --- Classifier signal (0–100) ---
         clf_score = (classifier.tampered_probability or 0.0) * 100
         if classifier.label == "TAMPERED" and classifier.confidence is not None and classifier.confidence > self.TAMPERED_CONFIDENCE_HIGH:
             flags.append(f"CNN classifier: TAMPERED (confidence {classifier.confidence*100:.0f}%)")
 
-        # --- Metadata signal (0–100) ---
         meta_score = self._metadata_anomaly_score(metadata, flags)
+        risk_score = (ela_score * 0.40) + (clf_score * 0.45) + (meta_score * 0.15)
 
-        # --- ManTraNet signal (0–100) ---
-        if mantranet is not None:
-            mantra_score = min(mantranet.forgery_score / 0.5, 1.0) * 100  # normalise (0.5 is very high)
-
-            if mantranet.forgery_score > self.MANTRANET_SCORE_THRESHOLD:
-                flags.append(
-                    f"ManTraNet: forgery detected (score {mantranet.forgery_score:.3f}, "
-                    f"{mantranet.tampered_regions} region(s), {mantranet.tampered_area_pct:.1f}% area)"
-                )
-            if mantranet.tampered_area_pct > 5.0:
-                flags.append(f"ManTraNet: {mantranet.tampered_area_pct:.1f}% of image area shows tampering signs")
-
-            # ── 4-signal weighted fusion ──
-            risk_score = (
-                ela_score * 0.25
-                + clf_score * 0.30
-                + mantra_score * 0.35
-                + meta_score * 0.10
-            )
-        else:
-            # ── 3-signal fallback (original weights) ──
-            risk_score = (ela_score * 0.40) + (clf_score * 0.45) + (meta_score * 0.15)
-
-        # --- Verdict thresholds ---
         if risk_score >= 60:
             verdict = "TAMPERED"
         elif risk_score <= 35:
@@ -377,74 +322,11 @@ class AnalysisOrchestrator:
         return verdict, risk_score, flags
 
     def _metadata_anomaly_score(self, metadata: ImageMetadata, flags: List[str]) -> float:
-        """
-        Heuristic anomaly scoring based on metadata signals.
-        Returns a 0–100 score where higher = more suspicious.
-        """
         score = 0.0
-
         if not metadata.has_exif:
-            score += 30  # EXIF stripped — common tampering step
+            score += 30
             flags.append("EXIF data missing — may have been stripped")
-
-        if metadata.software and any(
-            kw in metadata.software.lower()
-            for kw in ["photoshop", "gimp", "lightroom", "affinity", "pixelmator"]
-        ):
-            score += 50
-            flags.append(f"Editing software detected in EXIF: {metadata.software}")
-
-        # Mismatch between camera model presence and editing software
-        if metadata.camera_model and metadata.software:
-            score += 10
-            flags.append("Both camera EXIF and editing software signature present")
-
-        return min(score, 100)
-
-    # ── Summary Generation ────────────────────────────────────────────────────
-    def _generate_summary(
-        self,
-        verdict: str,
-        risk_score: float,
-        flags: List[str],
-        metadata: ImageMetadata,
-        ela: ELAResult,
-        classifier: ClassifierResult,
-        mantranet: Optional[MantraNetResult],
-    ) -> str:
-        """Generate a human-readable plain-English summary for the chat UI."""
-        verdict_lines = {
-            "AUTHENTIC": "✅ This image appears **authentic**.",
-            "TAMPERED": "🚨 This image shows **strong signs of tampering**.",
-            "UNCERTAIN": "⚠️ This image shows **some anomalies** — results are inconclusive.",
-        }
-        lines = [
-            verdict_lines[verdict],
-            f"Overall risk score: **{risk_score:.0f}/100**.",
-            "",
-            f"**ELA Analysis:** Mean intensity {ela.ela_mean:.1f}, {ela.suspicious_regions} suspicious region(s).",
-            f"**CNN Classifier:** {classifier.label} ({f'{classifier.confidence*100:.0f}%' if classifier.confidence is not None else 'N/A'} confidence).",
-        ]
-
-        # ManTraNet section
-        if mantranet is not None:
-            lines.append(
-                f"**ManTraNet Forensics:** Forgery score {mantranet.forgery_score:.3f}, "
-                f"{mantranet.tampered_regions} tampered region(s), "
-                f"{mantranet.tampered_area_pct:.1f}% area affected."
-            )
-
-        lines.append(
-            f"**Metadata:** {'Present' if metadata.has_exif else 'Missing/stripped'}"
-            + (f", shot with {metadata.camera_model}" if metadata.camera_model else "")
-            + "."
-        )
-
-        if flags:
-            lines += ["", "**Flags raised:**"] + [f"- {f}" for f in flags]
-
-        return "\n".join(lines)
-
-
-# Module-level singleton
-analysis_orchestrator = AnalysisOrchestrator()
+        if metadata.software and any(app in metadata.software.lower() for app in ["photoshop", "gimp", "canva", "midjourney"]):
+            score += 40
+            flags.append(f"Editing software signature found: {metadata.software}")
+        return min(score, 100.0)

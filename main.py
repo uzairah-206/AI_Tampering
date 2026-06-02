@@ -2,6 +2,13 @@
 SMARTZI Backend - FastAPI Entry Point
 AI-powered Image Metadata & Tampering Detection
 """
+import os
+# ── FORCE PYTORCH THREAD LIMITATION (CRITICAL FOR RENDER 512MB RAM) ──
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -14,13 +21,21 @@ from app.core.config import settings
 from app.core.logging import setup_logging
 from app.services.model_manager import model_manager
 
+# Ensure torch uses single-thread optimization if imported
+try:
+    import torch
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+except ImportError:
+    pass
+
 # Initialize logging
 setup_logging()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: run validations & warm up models. Shutdown: release GPU/memory resources."""
+    """Startup: run validations. Shutdown: release resources."""
     try:
         from app.core.startup_validator import startup_validator
         startup_validator.generate_report()
@@ -28,7 +43,7 @@ async def lifespan(app: FastAPI):
         import logging
         logging.getLogger("smartzi.main").error("Startup validator failed to run: %s", e)
 
-    await model_manager.initialize()
+    # CRITICAL: Removed model_manager.initialize() warmup to prevent boot OOM crash.
     yield
     await model_manager.dispose()
 

@@ -6,6 +6,7 @@ Fallback chain: TruFor → ManTraNet → Statistical signals.
 import logging
 import asyncio
 import time
+import gc
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -91,31 +92,19 @@ class ModelManager:
         self._attempted: List[str] = []
 
     async def initialize(self):
-        logger.info("ModelManager initializing...")
-        try:
-            from app.services.trufor_service import trufor_service
-            trufor_service.ensure_assets()
-            if trufor_service.initialize():
-                logger.info("TruFor — READY")
-            else:
-                logger.warning("TruFor — unavailable")
-        except Exception as e:
-            logger.error("TruFor warm-up failed: %s", e)
-
-        # Deprecated: ManTraNet initialization skipped
-        pass
-
+        # Prevent runtime overhead, configuration is handled on-demand during requests
         self._initialized = True
-        logger.info("ModelManager initialization complete.")
 
     async def dispose(self):
-        logger.info("ModelManager disposing resources...")
+        logger.info("ModelManager flushing cached memory structures...")
         try:
             import torch
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+            del torch
         except Exception:
             pass
+        gc.collect()
         self._initialized = False
 
     async def predict(
