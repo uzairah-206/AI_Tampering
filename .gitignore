@@ -1,0 +1,54 @@
+# SMARTZI Backend .gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Environment & secrets — NEVER commit these
+.env
+firebase-credentials.json
+*.pem
+*.key
+*.p12
+
+# Model weights (large binary — store in cloud/DVC)
+app/services/models/*.pth
+app/services/models/*.pt
+app/services/models/*.onnx
+models/
+weights/
+
+# Uploads / temp
+/tmp/
+*.upload
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
