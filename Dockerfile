@@ -6,9 +6,9 @@ FROM python:3.10-slim AS builder
 
 WORKDIR /app
 
-# Install build dependencies
+# Install build dependencies (Replaced libgl1-mesa-glx with libgl1)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    gcc g++ libffi-dev libgl1-mesa-glx libglib2.0-0 \
+    gcc g++ libffi-dev libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python deps into a virtual environment
@@ -23,9 +23,9 @@ FROM python:3.10-slim AS runtime
 
 WORKDIR /app
 
-# Runtime system libs for OpenCV + PIL
+# Runtime system libs for OpenCV + PIL (Replaced libgl1-mesa-glx with libgl1)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1-mesa-glx libglib2.0-0 libgomp1 \
+    libgl1 libglib2.0-0 libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy venv from builder
@@ -46,7 +46,7 @@ USER smartzi
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
     CMD python -c "import urllib.request, os; urllib.request.urlopen('http://localhost:' + os.environ.get('PORT', '8080') + '/health')"
 
-# Port exposed dynamically by Cloud Run
+# Port exposed dynamically by Cloud Run / Render
 ENV PORT=8080
 EXPOSE 8080
 
